@@ -34,14 +34,6 @@ else
 fi
 
 ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-echo -e "${GREEN}系统: $OS $VERSION ($CODENAME) $ARCH${NC}"
-
-# 显示当前 IP
-echo -e "\n${YELLOW}当前 IP 信息:${NC}"
-CURRENT_IP=$(curl -4 -s --max-time 5 ip.sb)
-IP_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$CURRENT_IP?lang=zh-CN" 2>/dev/null)
-echo -e "IP: ${GREEN}$CURRENT_IP${NC}"
-echo -e "位置: ${GREEN}$(echo $IP_INFO | grep -oP '"country":"\K[^"]+') - $(echo $IP_INFO | grep -oP '"city":"\K[^"]+')${NC}"
 
 # 安装 Cloudflare WARP 官方客户端
 install_warp() {
@@ -500,7 +492,7 @@ do_stop() {
 # 显示菜单
 show_menu() {
     echo -e "${YELLOW}请选择操作:${NC}\n"
-    echo -e "  ${GREEN}1.${NC} 安装 WARP (解锁 Gemini和商店等)"
+    echo -e "  ${GREEN}1.${NC} 安装 WARP (解锁 Google/Gemini，YouTube 直连)"
     echo -e "  ${GREEN}2.${NC} 卸载 WARP"
     echo -e "  ${GREEN}3.${NC} 查看状态"
     echo -e "  ${GREEN}0.${NC} 退出\n"
@@ -536,7 +528,30 @@ main() {
     ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
     echo -e "${GREEN}系统: $OS $VERSION ($CODENAME) $ARCH${NC}\n"
     
-    show_menu
+    # 显示当前 IP
+    echo -e "${YELLOW}当前 IP 信息:${NC}"
+    CURRENT_IP=$(curl -4 -s --max-time 5 ip.sb)
+    IP_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$CURRENT_IP?lang=zh-CN" 2>/dev/null)
+    echo -e "IP: ${GREEN}$CURRENT_IP${NC}"
+    echo -e "位置: ${GREEN}$(echo $IP_INFO | grep -oP '"country":"\K[^"]+') - $(echo $IP_INFO | grep -oP '"city":"\K[^"]+')${NC}\n"
+
+    # 判断是否带参数运行
+    if [ -n "$1" ]; then
+        case "$1" in
+            1)
+                echo -e "\n${YELLOW}检测到自动运行参数，开始安装 (仅解锁 Google/Gemini)...${NC}"
+                do_install
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}未知参数: $1${NC}"
+                echo "请使用 1 进行自动安装，或不带参数运行进入菜单。"
+                exit 1
+                ;;
+        esac
+    else
+        show_menu
+    fi
 }
 
-main
+main "$@"
