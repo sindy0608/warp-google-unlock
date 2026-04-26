@@ -132,13 +132,13 @@ setup_transparent_proxy() {
     # 安装 redsocks + ipset (透明代理工具)
     case $OS in
         ubuntu|debian)
-            apt-get install -y redsocks iptables ipset curl >/dev/null 2>&1
+            apt-get install -y redsocks iptables ipset >/dev/null 2>&1
             ;;
         centos|rhel|rocky|almalinux|fedora)
             if command -v dnf &>/dev/null; then
-                dnf install -y redsocks iptables ipset curl >/dev/null 2>&1
+                dnf install -y redsocks iptables ipset >/dev/null 2>&1
             else
-                yum install -y redsocks iptables ipset curl >/dev/null 2>&1
+                yum install -y redsocks iptables ipset >/dev/null 2>&1
             fi
             ;;
     esac
@@ -191,26 +191,42 @@ GOOGLE_IPS="
 216.239.32.0/19
 "
 
-# China IP 列表源 (APNIC 聚合)
-CN_IP_URL="https://raw.githubusercontent.com/herrbischoff/country-ip-blocks/master/ipv4/cn.cidr"
-CN_IP_BACKUP_URL="https://raw.githubusercontent.com/mayaxcn/china-ip-list/master/chnroute.txt"
 CN_IP_CACHE="/etc/warp/cn_ip.txt"
 
-# 下载中国 IP 列表
+# 从 APNIC 官方数据生成中国 CIDR 列表
 download_cn_ips() {
     mkdir -p /etc/warp
-    echo "下载中国大陆 IP 列表..."
-    if curl -sS --max-time 30 -o "$CN_IP_CACHE" "$CN_IP_URL" 2>/dev/null && [ -s "$CN_IP_CACHE" ]; then
-        echo "已从主源下载 $(wc -l < "$CN_IP_CACHE") 条 CIDR"
-    elif curl -sS --max-time 30 -o "$CN_IP_CACHE" "$CN_IP_BACKUP_URL" 2>/dev/null && [ -s "$CN_IP_CACHE" ]; then
-        echo "已从备用源下载 $(wc -l < "$CN_IP_CACHE") 条 CIDR"
-    else
-        echo "警告: 无法下载中国 IP 列表，跳过中国 IP 规则"
-        return 1
+    echo "下载中国大陆 IP 列表 (APNIC 官方源)..."
+
+    # 主源: APNIC delegated 文件，直接解析 CN IPv4 段转 CIDR
+    local tmp="/tmp/cn_ip_tmp.txt"
+    if curl -sS --max-time 60 https://ftp.apnic.net/stats/apnic/delegated-apnic-latest 2>/dev/null \
+        | grep '|CN|ipv4|' \
+        | awk -F'|' '{ printf("%s/%d\n", $4, 32-log($5)/log(2)) }' > "$tmp" \
+        && [ -s "$tmp" ] && [ "$(wc -l < "$tmp")" -gt 100 ]; then
+        mv "$tmp" "$CN_IP_CACHE"
+        echo "已从 APNIC 官方源下载 $(wc -l < "$CN_IP_CACHE") 条 CIDR"
+        return 0
     fi
-    # 清理：只保留有效 CIDR 行
-    sed -i '/^[[:space:]]*$/d; /^#/d' "$CN_IP_CACHE"
-    return 0
+
+    # 备用源: GitHub 预处理列表
+    echo "APNIC 源失败，尝试备用源..."
+    for url in \
+        "https://raw.githubusercontent.com/fernvenue/chn-cidr-list/master/cidr.txt" \
+        "https://raw.githubusercontent.com/metowolf/iplist/master/data/special/china.txt"; do
+        if curl -sS --max-time 30 -o "$tmp" "$url" 2>/dev/null \
+            && [ -s "$tmp" ] && [ "$(wc -l < "$tmp")" -gt 100 ]; then
+            # 只保留有效 CIDR 行
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$tmp" > "$CN_IP_CACHE"
+            echo "已从备用源下载 $(wc -l < "$CN_IP_CACHE") 条 CIDR"
+            rm -f "$tmp"
+            return 0
+        fi
+    done
+
+    rm -f "$tmp"
+    echo "警告: 所有源均失败，无法下载中国 IP 列表"
+    return 1
 }
 
 start() {
@@ -228,11 +244,11 @@ start() {
         iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345
     done
     
-    # 添加中国 IP 规则 (ipset，数量多，高效匹配)
+    # 添加中国 IP 规则 (ipset，高效匹配)
     ipset destroy cn_warp 2>/dev/null
     ipset create cn_warp hash:net hashsize 16384 maxelem 131072
     
-    # 如果缓存不存在或超过7天则重新下载
+    # 缓存不存在或超过7天则重新下载
     if [ ! -s "$CN_IP_CACHE" ] || [ $(find "$CN_IP_CACHE" -mtime +7 2>/dev/null | wc -l) -gt 0 ]; then
         download_cn_ips
     fi
@@ -265,6 +281,7 @@ stop() {
 
 update() {
     echo "更新中国 IP 列表..."
+    rm -f "$CN_IP_CACHE"
     download_cn_ips && echo "更新完成，请执行 restart 生效"
 }
 
@@ -279,8 +296,7 @@ status() {
     iptables -t nat -L WARP_GOOGLE -n 2>/dev/null | head -5 || echo "无规则"
     echo ""
     echo "=== ipset cn_warp ==="
-    ipset list cn_warp 2>/dev/null | head -8 || echo "未加载"
-    CN_COUNT=$(ipset list cn_warp 2>/dev/null | grep -c "^[0-9]")
+    CN_COUNT=$(ipset list cn_warp 2>/dev/null | grep -c "^[0-9]" || echo 0)
     echo "中国 IP 段数量: $CN_COUNT"
 }
 
@@ -335,7 +351,7 @@ test_connection() {
         echo -e "${YELLOW}Google 测试返回: $GOOGLE_TEST${NC}"
     fi
     
-    # 测试百度 (中国大陆)
+    # 测试百度
     BAIDU_TEST=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.baidu.com)
     if [ "$BAIDU_TEST" = "200" ]; then
         echo -e "${GREEN}✓ 百度连接成功 (via WARP)！${NC}"
@@ -435,7 +451,7 @@ do_install() {
     test_connection
     
     echo -e "\n${GREEN}╔════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║       🎉 安装完成！Google + 中国大陆已解锁 🎉       ║${NC}"
+    echo -e "${GREEN}║     🎉 安装完成！Google + 中国大陆已解锁 🎉         ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
     echo -e "\n${YELLOW}Google + 中国大陆 IP 流量现已自动通过 WARP！${NC}"
     echo -e "${YELLOW}无需任何额外配置，直接访问即可。${NC}"
