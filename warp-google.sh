@@ -14,7 +14,7 @@ show_banner() {
     clear
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════╗"
-    echo "║     🌐 WARP 一键脚本 - Google 自动解锁 🌐           ║"
+    echo "║   🌐 WARP 一键脚本 - Google + 中国大陆解锁 🌐      ║"
     echo "║         使用 Cloudflare 官方客户端                  ║"
     echo "╚════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -129,16 +129,16 @@ setup_transparent_proxy() {
         echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
     fi
     
-    # 安装 redsocks (透明代理工具)
+    # 安装 redsocks + ipset (透明代理工具)
     case $OS in
         ubuntu|debian)
-            apt-get install -y redsocks iptables >/dev/null 2>&1
+            apt-get install -y redsocks iptables ipset curl >/dev/null 2>&1
             ;;
         centos|rhel|rocky|almalinux|fedora)
             if command -v dnf &>/dev/null; then
-                dnf install -y redsocks iptables >/dev/null 2>&1
+                dnf install -y redsocks iptables ipset curl >/dev/null 2>&1
             else
-                yum install -y redsocks iptables >/dev/null 2>&1
+                yum install -y redsocks iptables ipset curl >/dev/null 2>&1
             fi
             ;;
     esac
@@ -191,8 +191,30 @@ GOOGLE_IPS="
 216.239.32.0/19
 "
 
+# China IP 列表源 (APNIC 聚合)
+CN_IP_URL="https://raw.githubusercontent.com/herrbischoff/country-ip-blocks/master/ipv4/cn.cidr"
+CN_IP_BACKUP_URL="https://raw.githubusercontent.com/mayaxcn/china-ip-list/master/chnroute.txt"
+CN_IP_CACHE="/etc/warp/cn_ip.txt"
+
+# 下载中国 IP 列表
+download_cn_ips() {
+    mkdir -p /etc/warp
+    echo "下载中国大陆 IP 列表..."
+    if curl -sS --max-time 30 -o "$CN_IP_CACHE" "$CN_IP_URL" 2>/dev/null && [ -s "$CN_IP_CACHE" ]; then
+        echo "已从主源下载 $(wc -l < "$CN_IP_CACHE") 条 CIDR"
+    elif curl -sS --max-time 30 -o "$CN_IP_CACHE" "$CN_IP_BACKUP_URL" 2>/dev/null && [ -s "$CN_IP_CACHE" ]; then
+        echo "已从备用源下载 $(wc -l < "$CN_IP_CACHE") 条 CIDR"
+    else
+        echo "警告: 无法下载中国 IP 列表，跳过中国 IP 规则"
+        return 1
+    fi
+    # 清理：只保留有效 CIDR 行
+    sed -i '/^[[:space:]]*$/d; /^#/d' "$CN_IP_CACHE"
+    return 0
+}
+
 start() {
-    echo "启动 Google 透明代理..."
+    echo "启动 WARP 透明代理 (Google + China)..."
     
     # 启动 redsocks
     pkill redsocks 2>/dev/null
@@ -201,24 +223,49 @@ start() {
     # 创建新的 iptables 链
     iptables -t nat -N WARP_GOOGLE 2>/dev/null || iptables -t nat -F WARP_GOOGLE
     
-    # 添加 Google IP 规则
+    # 添加 Google IP 规则 (逐条，数量少)
     for ip in $GOOGLE_IPS; do
         iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345
     done
     
+    # 添加中国 IP 规则 (ipset，数量多，高效匹配)
+    ipset destroy cn_warp 2>/dev/null
+    ipset create cn_warp hash:net hashsize 16384 maxelem 131072
+    
+    # 如果缓存不存在或超过7天则重新下载
+    if [ ! -s "$CN_IP_CACHE" ] || [ $(find "$CN_IP_CACHE" -mtime +7 2>/dev/null | wc -l) -gt 0 ]; then
+        download_cn_ips
+    fi
+    
+    if [ -s "$CN_IP_CACHE" ]; then
+        local count=0
+        while IFS= read -r cidr; do
+            [ -z "$cidr" ] && continue
+            ipset add cn_warp "$cidr" 2>/dev/null && count=$((count+1))
+        done < "$CN_IP_CACHE"
+        echo "已加载 $count 条中国 IP 段到 ipset"
+        iptables -t nat -A WARP_GOOGLE -p tcp -m set --match-set cn_warp dst -j REDIRECT --to-ports 12345
+    fi
+    
     # 应用到 OUTPUT 链
     iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || iptables -t nat -A OUTPUT -j WARP_GOOGLE
     
-    echo "Google 透明代理已启动"
+    echo "WARP 透明代理已启动 (Google + China)"
 }
 
 stop() {
-    echo "停止 Google 透明代理..."
+    echo "停止 WARP 透明代理..."
     pkill redsocks 2>/dev/null
     iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
     iptables -t nat -F WARP_GOOGLE 2>/dev/null
     iptables -t nat -X WARP_GOOGLE 2>/dev/null
-    echo "Google 透明代理已停止"
+    ipset destroy cn_warp 2>/dev/null
+    echo "WARP 透明代理已停止"
+}
+
+update() {
+    echo "更新中国 IP 列表..."
+    download_cn_ips && echo "更新完成，请执行 restart 生效"
 }
 
 status() {
@@ -230,6 +277,11 @@ status() {
     echo ""
     echo "=== iptables 规则 ==="
     iptables -t nat -L WARP_GOOGLE -n 2>/dev/null | head -5 || echo "无规则"
+    echo ""
+    echo "=== ipset cn_warp ==="
+    ipset list cn_warp 2>/dev/null | head -8 || echo "未加载"
+    CN_COUNT=$(ipset list cn_warp 2>/dev/null | grep -c "^[0-9]")
+    echo "中国 IP 段数量: $CN_COUNT"
 }
 
 case "$1" in
@@ -237,7 +289,8 @@ case "$1" in
     stop) stop ;;
     restart) stop; sleep 1; start ;;
     status) status ;;
-    *) echo "用法: $0 {start|stop|restart|status}" ;;
+    update) update ;;
+    *) echo "用法: $0 {start|stop|restart|status|update}" ;;
 esac
 SCRIPT
 
@@ -282,6 +335,14 @@ test_connection() {
         echo -e "${YELLOW}Google 测试返回: $GOOGLE_TEST${NC}"
     fi
     
+    # 测试百度 (中国大陆)
+    BAIDU_TEST=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.baidu.com)
+    if [ "$BAIDU_TEST" = "200" ]; then
+        echo -e "${GREEN}✓ 百度连接成功 (via WARP)！${NC}"
+    else
+        echo -e "${YELLOW}百度测试返回: $BAIDU_TEST${NC}"
+    fi
+    
     # 显示 WARP IP
     WARP_IP=$(curl -x socks5://127.0.0.1:40000 -s --max-time 10 ip.sb 2>/dev/null)
     if [ -n "$WARP_IP" ]; then
@@ -314,9 +375,14 @@ case "$1" in
         sleep 2
         $0 start
         ;;
+    update)
+        /usr/local/bin/warp-google update
+        ;;
     test)
         echo "测试 Google 连接..."
         curl -s --max-time 10 -o /dev/null -w "状态码: %{http_code}\n" https://www.google.com
+        echo "测试百度连接 (via WARP)..."
+        curl -s --max-time 10 -o /dev/null -w "状态码: %{http_code}\n" https://www.baidu.com
         ;;
     ip)
         echo "直连 IP:"
@@ -335,11 +401,13 @@ case "$1" in
         rm -f /usr/local/bin/warp-google
         rm -f /usr/local/bin/warp
         rm -f /etc/redsocks.conf
+        rm -rf /etc/warp
+        ipset destroy cn_warp 2>/dev/null
         apt-get remove -y cloudflare-warp redsocks 2>/dev/null || yum remove -y cloudflare-warp redsocks 2>/dev/null
         echo "WARP 已卸载"
         ;;
     *)
-        echo "WARP 管理工具"
+        echo "WARP 管理工具 (Google + China)"
         echo ""
         echo "用法: warp <命令>"
         echo ""
@@ -348,7 +416,8 @@ case "$1" in
         echo "  start     启动 WARP"
         echo "  stop      停止 WARP"
         echo "  restart   重启 WARP"
-        echo "  test      测试 Google"
+        echo "  update    更新中国 IP 列表"
+        echo "  test      测试 Google + 百度"
         echo "  ip        查看 IP"
         echo "  uninstall 卸载 WARP"
         ;;
@@ -366,11 +435,11 @@ do_install() {
     test_connection
     
     echo -e "\n${GREEN}╔════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║            🎉 安装完成！Google 已解锁 🎉            ║${NC}"
+    echo -e "${GREEN}║       🎉 安装完成！Google + 中国大陆已解锁 🎉       ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
-    echo -e "\n${YELLOW}所有 Google 流量现已自动通过 WARP！${NC}"
+    echo -e "\n${YELLOW}Google + 中国大陆 IP 流量现已自动通过 WARP！${NC}"
     echo -e "${YELLOW}无需任何额外配置，直接访问即可。${NC}"
-    echo -e "\n管理命令: ${CYAN}warp {status|start|stop|restart|test|ip|uninstall}${NC}\n"
+    echo -e "\n管理命令: ${CYAN}warp {status|start|stop|restart|update|test|ip|uninstall}${NC}\n"
 }
 
 # 卸载
@@ -389,9 +458,13 @@ do_uninstall() {
     iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
     iptables -t nat -F WARP_GOOGLE 2>/dev/null
     iptables -t nat -X WARP_GOOGLE 2>/dev/null
+    ipset destroy cn_warp 2>/dev/null
     
     # 删除 IPv6 黑洞路由
     ip -6 route del blackhole 2607:f8b0::/32 2>/dev/null
+    
+    # 清理缓存
+    rm -rf /etc/warp
     
     # 卸载软件包
     case $OS in
@@ -462,14 +535,20 @@ do_show_ip() {
     echo -e "${CYAN}══════════════════════════════════════${NC}\n"
 }
 
-# 测试 Google 连接
+# 测试连接
 do_test_google() {
-    echo -e "\n${CYAN}测试 Google 连接...${NC}"
+    echo -e "\n${CYAN}测试连接...${NC}"
     RESULT=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.google.com)
     if [ "$RESULT" = "200" ]; then
-        echo -e "${GREEN}✓ Google 连接成功！状态码: $RESULT${NC}\n"
+        echo -e "${GREEN}✓ Google 连接成功！状态码: $RESULT${NC}"
     else
-        echo -e "${RED}✗ Google 连接失败，状态码: $RESULT${NC}\n"
+        echo -e "${RED}✗ Google 连接失败，状态码: $RESULT${NC}"
+    fi
+    RESULT2=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.baidu.com)
+    if [ "$RESULT2" = "200" ]; then
+        echo -e "${GREEN}✓ 百度连接成功 (via WARP)！状态码: $RESULT2${NC}\n"
+    else
+        echo -e "${RED}✗ 百度连接失败，状态码: $RESULT2${NC}\n"
     fi
 }
 
@@ -492,7 +571,7 @@ do_stop() {
 # 显示菜单
 show_menu() {
     echo -e "${YELLOW}请选择操作:${NC}\n"
-    echo -e "  ${GREEN}1.${NC} 安装 WARP (解锁 Google/Gemini，YouTube 直连)"
+    echo -e "  ${GREEN}1.${NC} 安装 WARP (解锁 Google/Gemini + 中国大陆)"
     echo -e "  ${GREEN}2.${NC} 卸载 WARP"
     echo -e "  ${GREEN}3.${NC} 查看状态"
     echo -e "  ${GREEN}0.${NC} 退出\n"
@@ -539,7 +618,7 @@ main() {
     if [ -n "$1" ]; then
         case "$1" in
             1)
-                echo -e "\n${YELLOW}检测到自动运行参数，开始安装 (仅解锁 Google/Gemini)...${NC}"
+                echo -e "\n${YELLOW}检测到自动运行参数，开始安装 (解锁 Google/Gemini + 中国大陆)...${NC}"
                 do_install
                 exit 0
                 ;;
