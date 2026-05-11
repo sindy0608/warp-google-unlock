@@ -239,6 +239,14 @@ start() {
     # 创建新的 iptables 链
     iptables -t nat -N WARP_GOOGLE 2>/dev/null || iptables -t nat -F WARP_GOOGLE
     
+    # 排除 Clash/代理客户端测速地址 (这些域名 IP 在 Google 段内，不应走 WARP)
+    EXCLUDE_DOMAINS="www.gstatic.com cp.cloudflare.com"
+    for domain in $EXCLUDE_DOMAINS; do
+        for eip in $(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u); do
+            [ -n "$eip" ] && iptables -t nat -A WARP_GOOGLE -d "$eip/32" -j RETURN
+        done
+    done
+
     # 添加 Google IP 规则 (逐条，数量少)
     for ip in $GOOGLE_IPS; do
         iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345
