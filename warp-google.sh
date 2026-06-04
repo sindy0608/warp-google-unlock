@@ -237,14 +237,38 @@ start() {
     redsocks -c /etc/redsocks.conf
     
     # 创建新的 iptables 链
-    iptables -t nat -N WARP_GOOGLE 2>/dev/null || iptables -t nat -F WARP_GOOGLE    
+    iptables -t nat -N WARP_GOOGLE 2>/dev/null || iptables -t nat -F WARP_GOOGLE
 
-    # 添加 Google IP 规则 (逐条，数量少)
+    # ===== 第一步：排除测速地址，绝对不走 WARP =====
+    # gstatic generate_204 测速地址（HTTP + HTTPS 均排除）
+    # www.gstatic.com 解析到 142.250.x.x / 172.217.x.x，需在 Google IP 规则之前 RETURN
+    for SPEEDTEST_HOST in \
+        "www.gstatic.com" \
+        "connectivitycheck.gstatic.com"; do
+        # 动态解析测速域名，将解析到的 IP 加入排除规则
+        RESOLVED_IPS=$(getent ahostsv4 "$SPEEDTEST_HOST" 2>/dev/null | awk '{print $1}' | sort -u)
+        for rip in $RESOLVED_IPS; do
+            iptables -t nat -A WARP_GOOGLE -d "$rip" -p tcp --dport 80  -j RETURN
+            iptables -t nat -A WARP_GOOGLE -d "$rip" -p tcp --dport 443 -j RETURN
+        done
+    done
+    # 静态兜底：gstatic 的已知 CIDR（防止解析失败）
+    for STATIC_CIDR in \
+        "142.250.0.0/15" \
+        "172.217.0.0/16"; do
+        iptables -t nat -A WARP_GOOGLE -d "$STATIC_CIDR" -p tcp --dport 80  -m string \
+            --string "generate_204" --algo bm -j RETURN
+        iptables -t nat -A WARP_GOOGLE -d "$STATIC_CIDR" -p tcp --dport 443 -m string \
+            --string "generate_204" --algo bm -j RETURN
+    done
+
+    # ===== 第二步：Google IP 走 WARP =====
     for ip in $GOOGLE_IPS; do
         iptables -t nat -A WARP_GOOGLE -d $ip -p tcp --dport 443 -j REDIRECT --to-ports 12345
+        iptables -t nat -A WARP_GOOGLE -d $ip -p tcp --dport 80  -j REDIRECT --to-ports 12345
     done
     
-    # 添加中国 IP 规则 (ipset，高效匹配)
+    # ===== 第三步：中国 IP 走 WARP =====
     ipset destroy cn_warp 2>/dev/null
     ipset create cn_warp hash:net hashsize 16384 maxelem 131072
     
@@ -260,7 +284,8 @@ start() {
             ipset add cn_warp "$cidr" 2>/dev/null && count=$((count+1))
         done < "$CN_IP_CACHE"
         echo "已加载 $count 条中国 IP 段到 ipset"
-        iptables -t nat -A WARP_GOOGLE -p tcp -m set --match-set cn_warp dst -j REDIRECT --to-ports 12345
+        iptables -t nat -A WARP_GOOGLE -p tcp --dport 443 -m set --match-set cn_warp dst -j REDIRECT --to-ports 12345
+        iptables -t nat -A WARP_GOOGLE -p tcp --dport 80  -m set --match-set cn_warp dst -j REDIRECT --to-ports 12345
     fi
     
     # 应用到 OUTPUT 链
