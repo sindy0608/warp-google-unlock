@@ -212,6 +212,13 @@ start() {
     # 创建新的 iptables 链
     iptables -t nat -N WARP_GOOGLE 2>/dev/null || iptables -t nat -F WARP_GOOGLE
 
+    # 排除 Clash 测速地址 (gstatic 在 Google IP 段内，必须在 REDIRECT 之前 RETURN)
+    for domain in www.gstatic.com connectivitycheck.gstatic.com; do
+        for eip in $(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u); do
+            [ -n "$eip" ] && iptables -t nat -A WARP_GOOGLE -d "$eip/32" -j RETURN
+        done
+    done
+    
     # Google IP 走 WARP (仅 HTTPS 443)
     for ip in $GOOGLE_IPS; do
         iptables -t nat -A WARP_GOOGLE -d $ip -p tcp --dport 443 -j REDIRECT --to-ports 12345
