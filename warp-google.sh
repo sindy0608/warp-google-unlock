@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # WARP 一键脚本 - 使用 Cloudflare 官方客户端
-# 让 Google 流量自动走 WARP，解锁受限服务
+# 让 Google + 中国大陆流量自动走 WARP
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -14,8 +14,8 @@ show_banner() {
     clear
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║   🌐 WARP 一键脚本 - Google(除gstatic第二代) + 中国大陆解锁 🌐       ║"
-    echo "║                 使用 Cloudflare 官方客户端                   ║"
+    echo "║   🌐 WARP 一键脚本 - Google + 中国大陆解锁 (仅443) 🌐    ║"
+    echo "║                 使用 Cloudflare 官方客户端                 ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -41,22 +41,14 @@ install_warp() {
     
     case $OS in
         ubuntu|debian)
-            # 先安装必要依赖
             apt-get update -y >/dev/null 2>&1
             apt-get install -y gnupg curl wget lsb-release >/dev/null 2>&1
-            
-            # 添加 Cloudflare GPG 密钥
             curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-            
-            # 添加仓库
             echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $CODENAME main" > /etc/apt/sources.list.d/cloudflare-client.list
-            
-            # 安装
             apt-get update -y
             apt-get install -y cloudflare-warp
             ;;
         centos|rhel|rocky|almalinux|fedora)
-            # 添加仓库
             cat > /etc/yum.repos.d/cloudflare-warp.repo << 'EOF'
 [cloudflare-warp]
 name=Cloudflare WARP
@@ -73,7 +65,6 @@ EOF
             ;;
         *)
             echo -e "${RED}不支持的系统: $OS${NC}"
-            echo -e "${YELLOW}支持的系统: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, Fedora${NC}"
             exit 1
             ;;
     esac
@@ -90,55 +81,40 @@ EOF
 configure_warp() {
     echo -e "\n${CYAN}[2/3] 配置 WARP...${NC}"
     
-    # 注册设备
     echo -e "正在注册设备..."
     warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || true
-    
-    # 设置为代理模式 (不会接管全部流量，只通过 SOCKS5 代理)
     warp-cli --accept-tos mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
-    
-    # 设置代理端口
     warp-cli --accept-tos proxy port 40000 2>/dev/null || warp-cli proxy port 40000 2>/dev/null || true
     
-    # 连接
     echo -e "正在连接 WARP..."
     warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null
     
     sleep 3
-    
-    # 显示状态
     STATUS=$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null)
     echo -e "状态: ${GREEN}$STATUS${NC}"
-    
     echo -e "${GREEN}✓ WARP 配置完成${NC}"
 }
 
-# 配置透明代理 (让 Google 流量自动走 WARP)
+# 配置透明代理
 setup_transparent_proxy() {
     echo -e "\n${CYAN}[3/3] 配置透明代理规则...${NC}"
     
-    # 禁用 IPv6 访问 Google（避免 IPv4/IPv6 不匹配导致被检测）
     echo -e "配置 IPv6 规则..."
-    
-    # 方法1: 添加 IPv6 黑洞路由到 Google IPv6 地址
-    # Google IPv6 范围: 2607:f8b0::/32
     ip -6 route add blackhole 2607:f8b0::/32 2>/dev/null || true
-    
-    # 方法2: 设置系统优先使用 IPv4
     if ! grep -q "precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
         echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
     fi
     
-    # 安装 redsocks + ipset (透明代理工具)
+    # 安装 redsocks + ipset
     case $OS in
         ubuntu|debian)
-            apt-get install -y redsocks iptables ipset >/dev/null 2>&1
+            apt-get install -y redsocks iptables ipset curl >/dev/null 2>&1
             ;;
         centos|rhel|rocky|almalinux|fedora)
             if command -v dnf &>/dev/null; then
-                dnf install -y redsocks iptables ipset >/dev/null 2>&1
+                dnf install -y redsocks iptables ipset curl >/dev/null 2>&1
             else
-                yum install -y redsocks iptables ipset >/dev/null 2>&1
+                yum install -y redsocks iptables ipset curl >/dev/null 2>&1
             fi
             ;;
     esac
@@ -198,7 +174,6 @@ download_cn_ips() {
     mkdir -p /etc/warp
     echo "下载中国大陆 IP 列表 (APNIC 官方源)..."
 
-    # 主源: APNIC delegated 文件，直接解析 CN IPv4 段转 CIDR
     local tmp="/tmp/cn_ip_tmp.txt"
     if curl -sS --max-time 60 https://ftp.apnic.net/stats/apnic/delegated-apnic-latest 2>/dev/null \
         | grep '|CN|ipv4|' \
@@ -209,14 +184,12 @@ download_cn_ips() {
         return 0
     fi
 
-    # 备用源: GitHub 预处理列表
     echo "APNIC 源失败，尝试备用源..."
     for url in \
         "https://raw.githubusercontent.com/fernvenue/chn-cidr-list/master/cidr.txt" \
         "https://raw.githubusercontent.com/metowolf/iplist/master/data/special/china.txt"; do
         if curl -sS --max-time 30 -o "$tmp" "$url" 2>/dev/null \
             && [ -s "$tmp" ] && [ "$(wc -l < "$tmp")" -gt 100 ]; then
-            # 只保留有效 CIDR 行
             grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$tmp" > "$CN_IP_CACHE"
             echo "已从备用源下载 $(wc -l < "$CN_IP_CACHE") 条 CIDR"
             rm -f "$tmp"
@@ -230,7 +203,7 @@ download_cn_ips() {
 }
 
 start() {
-    echo "启动 WARP 透明代理 (Google + China)..."
+    echo "启动 WARP 透明代理 (Google + China, 仅443)..."
     
     # 启动 redsocks
     pkill redsocks 2>/dev/null
@@ -239,40 +212,15 @@ start() {
     # 创建新的 iptables 链
     iptables -t nat -N WARP_GOOGLE 2>/dev/null || iptables -t nat -F WARP_GOOGLE
 
-    # ===== 第一步：排除测速地址，绝对不走 WARP =====
-    # gstatic generate_204 测速地址（HTTP + HTTPS 均排除）
-    # www.gstatic.com 解析到 142.250.x.x / 172.217.x.x，需在 Google IP 规则之前 RETURN
-    for SPEEDTEST_HOST in \
-        "www.gstatic.com" \
-        "connectivitycheck.gstatic.com"; do
-        # 动态解析测速域名，将解析到的 IP 加入排除规则
-        RESOLVED_IPS=$(getent ahostsv4 "$SPEEDTEST_HOST" 2>/dev/null | awk '{print $1}' | sort -u)
-        for rip in $RESOLVED_IPS; do
-            iptables -t nat -A WARP_GOOGLE -d "$rip" -p tcp --dport 80  -j RETURN
-            iptables -t nat -A WARP_GOOGLE -d "$rip" -p tcp --dport 443 -j RETURN
-        done
-    done
-    # 静态兜底：gstatic 的已知 CIDR（防止解析失败）
-    for STATIC_CIDR in \
-        "142.250.0.0/15" \
-        "172.217.0.0/16"; do
-        iptables -t nat -A WARP_GOOGLE -d "$STATIC_CIDR" -p tcp --dport 80  -m string \
-            --string "generate_204" --algo bm -j RETURN
-        iptables -t nat -A WARP_GOOGLE -d "$STATIC_CIDR" -p tcp --dport 443 -m string \
-            --string "generate_204" --algo bm -j RETURN
-    done
-
-    # ===== 第二步：Google IP 走 WARP =====
+    # Google IP 走 WARP (仅 HTTPS 443)
     for ip in $GOOGLE_IPS; do
         iptables -t nat -A WARP_GOOGLE -d $ip -p tcp --dport 443 -j REDIRECT --to-ports 12345
-        iptables -t nat -A WARP_GOOGLE -d $ip -p tcp --dport 80  -j REDIRECT --to-ports 12345
     done
     
-    # ===== 第三步：中国 IP 走 WARP =====
+    # 中国 IP 走 WARP (仅 HTTPS 443)
     ipset destroy cn_warp 2>/dev/null
     ipset create cn_warp hash:net hashsize 16384 maxelem 131072
     
-    # 缓存不存在或超过7天则重新下载
     if [ ! -s "$CN_IP_CACHE" ] || [ $(find "$CN_IP_CACHE" -mtime +7 2>/dev/null | wc -l) -gt 0 ]; then
         download_cn_ips
     fi
@@ -285,13 +233,12 @@ start() {
         done < "$CN_IP_CACHE"
         echo "已加载 $count 条中国 IP 段到 ipset"
         iptables -t nat -A WARP_GOOGLE -p tcp --dport 443 -m set --match-set cn_warp dst -j REDIRECT --to-ports 12345
-        iptables -t nat -A WARP_GOOGLE -p tcp --dport 80  -m set --match-set cn_warp dst -j REDIRECT --to-ports 12345
     fi
     
     # 应用到 OUTPUT 链
     iptables -t nat -C OUTPUT -j WARP_GOOGLE 2>/dev/null || iptables -t nat -A OUTPUT -j WARP_GOOGLE
     
-    echo "WARP 透明代理已启动 (Google + China)"
+    echo "WARP 透明代理已启动 (Google + China, 仅443)"
 }
 
 stop() {
@@ -368,7 +315,6 @@ test_connection() {
     
     sleep 2
     
-    # 测试 Google
     GOOGLE_TEST=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.google.com)
     if [ "$GOOGLE_TEST" = "200" ]; then
         echo -e "${GREEN}✓ Google 连接成功！${NC}"
@@ -376,7 +322,6 @@ test_connection() {
         echo -e "${YELLOW}Google 测试返回: $GOOGLE_TEST${NC}"
     fi
     
-    # 测试百度
     BAIDU_TEST=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.baidu.com)
     if [ "$BAIDU_TEST" = "200" ]; then
         echo -e "${GREEN}✓ 百度连接成功 (via WARP)！${NC}"
@@ -384,7 +329,6 @@ test_connection() {
         echo -e "${YELLOW}百度测试返回: $BAIDU_TEST${NC}"
     fi
     
-    # 显示 WARP IP
     WARP_IP=$(curl -x socks5://127.0.0.1:40000 -s --max-time 10 ip.sb 2>/dev/null)
     if [ -n "$WARP_IP" ]; then
         WARP_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$WARP_IP?lang=zh-CN" 2>/dev/null)
@@ -448,7 +392,7 @@ case "$1" in
         echo "WARP 已卸载"
         ;;
     *)
-        echo "WARP 管理工具 (Google + China)"
+        echo "WARP 管理工具 (Google + China, 仅443)"
         echo ""
         echo "用法: warp <命令>"
         echo ""
@@ -478,8 +422,8 @@ do_install() {
     echo -e "\n${GREEN}╔════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║     🎉 安装完成！Google + 中国大陆已解锁 🎉         ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
-    echo -e "\n${YELLOW}Google + 中国大陆 IP 流量现已自动通过 WARP！${NC}"
-    echo -e "${YELLOW}无需任何额外配置，直接访问即可。${NC}"
+    echo -e "\n${YELLOW}Google + 中国大陆 HTTPS 流量现已自动通过 WARP！${NC}"
+    echo -e "${YELLOW}HTTP 80 端口保持直连 (不影响 Clash 测速)。${NC}"
     echo -e "\n管理命令: ${CYAN}warp {status|start|stop|restart|update|test|ip|uninstall}${NC}\n"
 }
 
@@ -495,19 +439,14 @@ do_uninstall() {
     rm -f /usr/local/bin/warp
     rm -f /etc/redsocks.conf
     
-    # 清理 iptables 规则
     iptables -t nat -D OUTPUT -j WARP_GOOGLE 2>/dev/null
     iptables -t nat -F WARP_GOOGLE 2>/dev/null
     iptables -t nat -X WARP_GOOGLE 2>/dev/null
     ipset destroy cn_warp 2>/dev/null
     
-    # 删除 IPv6 黑洞路由
     ip -6 route del blackhole 2607:f8b0::/32 2>/dev/null
-    
-    # 清理缓存
     rm -rf /etc/warp
     
-    # 卸载软件包
     case $OS in
         ubuntu|debian)
             apt-get remove -y cloudflare-warp redsocks 2>/dev/null
@@ -526,7 +465,6 @@ do_uninstall() {
 do_status() {
     echo -e "\n${CYAN}══════════════ WARP 运行状态 ══════════════${NC}\n"
     
-    # WARP 客户端状态
     echo -e "${YELLOW}【WARP 客户端】${NC}"
     if command -v warp-cli &>/dev/null; then
         warp-cli status 2>/dev/null || echo "未运行"
@@ -535,8 +473,6 @@ do_status() {
     fi
     
     echo ""
-    
-    # Redsocks 状态
     echo -e "${YELLOW}【透明代理】${NC}"
     if pgrep -x redsocks >/dev/null; then
         echo -e "${GREEN}运行中${NC}"
@@ -545,8 +481,6 @@ do_status() {
     fi
     
     echo ""
-    
-    # iptables 规则
     echo -e "${YELLOW}【iptables 规则】${NC}"
     iptables -t nat -L WARP_GOOGLE -n 2>/dev/null | head -3 || echo -e "${RED}无规则${NC}"
     
@@ -593,22 +527,6 @@ do_test_google() {
     fi
 }
 
-# 启动服务
-do_start() {
-    echo -e "\n${CYAN}启动 WARP 服务...${NC}"
-    warp-cli connect 2>/dev/null
-    /usr/local/bin/warp-google start 2>/dev/null
-    echo -e "${GREEN}✓ WARP 已启动${NC}\n"
-}
-
-# 停止服务
-do_stop() {
-    echo -e "\n${CYAN}停止 WARP 服务...${NC}"
-    /usr/local/bin/warp-google stop 2>/dev/null
-    warp-cli disconnect 2>/dev/null
-    echo -e "${GREEN}✓ WARP 已停止${NC}\n"
-}
-
 # 显示菜单
 show_menu() {
     echo -e "${YELLOW}请选择操作:${NC}\n"
@@ -632,10 +550,8 @@ show_menu() {
 main() {
     show_banner
     
-    # 检查 root
     [[ $EUID -ne 0 ]] && { echo -e "${RED}请使用 root 运行！${NC}"; exit 1; }
     
-    # 检测系统
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS=$ID
@@ -648,14 +564,12 @@ main() {
     ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
     echo -e "${GREEN}系统: $OS $VERSION ($CODENAME) $ARCH${NC}\n"
     
-    # 显示当前 IP
     echo -e "${YELLOW}当前 IP 信息:${NC}"
     CURRENT_IP=$(curl -4 -s --max-time 5 ip.sb)
     IP_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$CURRENT_IP?lang=zh-CN" 2>/dev/null)
     echo -e "IP: ${GREEN}$CURRENT_IP${NC}"
     echo -e "位置: ${GREEN}$(echo $IP_INFO | grep -oP '"country":"\K[^"]+') - $(echo $IP_INFO | grep -oP '"city":"\K[^"]+')${NC}\n"
 
-    # 判断是否带参数运行
     if [ -n "$1" ]; then
         case "$1" in
             1)
@@ -665,7 +579,6 @@ main() {
                 ;;
             *)
                 echo -e "${RED}未知参数: $1${NC}"
-                echo "请使用 1 进行自动安装，或不带参数运行进入菜单。"
                 exit 1
                 ;;
         esac
