@@ -14,8 +14,8 @@ show_banner() {
     clear
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║   🌐 WARP 一键脚本 - Google + 中国大陆解锁 (仅443) 🌐          ║"
-    echo "║     使用 Cloudflare 官方客户端(修正redsocks )                 ║"
+    echo "║    WARP 一键脚本 - Google + 中国大陆解锁 (仅443)               ║"
+    echo "║      Cloudflare 官方客户端(修正redsocks/0823)                 ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
