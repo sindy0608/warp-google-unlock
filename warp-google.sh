@@ -516,10 +516,14 @@ EOF
     systemctl daemon-reload
     systemctl enable warp-google 2>/dev/null || true
 
-    # 重新应用透明代理规则，systemd 只负责保持后续开机启动。
-    /usr/local/bin/warp-google restart
+    # 由 systemd 正式启动/重启透明代理
+    systemctl restart warp-google
 
-    echo -e "${GREEN}✓ 透明代理配置完成${NC}"
+    if ! systemctl is-active --quiet warp-google; then
+    echo -e "${RED}✗ warp-google.service 启动失败${NC}"
+    systemctl status warp-google --no-pager -l
+    exit 1
+    fi
 }
 
 test_connection() {
