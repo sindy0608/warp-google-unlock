@@ -88,129 +88,164 @@ configure_warp() {
     systemctl enable warp-svc 2>/dev/null || true
     systemctl restart warp-svc
 
-    # 最多等待 20 秒
+    # 等待 daemon 正常启动
     for i in $(seq 1 20); do
         if systemctl is-active --quiet warp-svc; then
-            sleep 2
+            echo -e "${GREEN}✓ warp-svc 已启动${NC}"
             break
         fi
+
+        if [ "$i" -eq 20 ]; then
+            echo -e "${RED}✗ warp-svc 启动失败${NC}"
+            systemctl status warp-svc --no-pager -l
+            exit 1
+        fi
+
         sleep 1
     done
 
-    if ! systemctl is-active --quiet warp-svc; then
-        echo -e "${RED}✗ warp-svc 启动失败${NC}"
-        systemctl status warp-svc --no-pager -l
-        exit 1
-    fi
-
-    echo -e "${GREEN}✓ warp-svc 已启动${NC}"
-
-    # 等待 CLI 与 daemon IPC 完全可用
-    for i in $(seq 1 15); do
-        STATUS=$(warp-cli --accept-tos status 2>&1)
-
-        if ! echo "$STATUS" | grep -qiE \
-            'Daemon Startup|Unable to connect|IPC|initializing'; then
-            break
-        fi
-
-        echo "等待 WARP daemon 就绪... ($i/15)"
-        sleep 2
-    done
+    # 给 WARP daemon 一点初始化时间
+    sleep 3
 
     echo "检查 WARP 注册状态..."
 
-    REGISTRATION=$(warp-cli --accept-tos registration show 2>&1 || true)
+    STATUS=$(warp-cli --accept-tos status 2>&1 || true)
 
-    if echo "$REGISTRATION" | grep -qiE \
-        'not registered|registration missing|no registration|error'; then
+    # 如果没有注册，则注册
+    if echo "$STATUS" | grep -qiE \
+        'Registration Missing|not registered|registration missing'; then
 
         echo "当前设备未注册，开始注册..."
 
         if ! warp-cli --accept-tos registration new; then
             echo -e "${RED}✗ WARP 注册失败${NC}"
-            echo ""
             warp-cli --accept-tos status || true
-            echo ""
-            systemctl status warp-svc --no-pager -l
             exit 1
         fi
 
+        echo -e "${GREEN}✓ WARP 注册成功${NC}"
         sleep 3
-
-    elif echo "$REGISTRATION" | grep -qiE \
-        'Account type|Device|Registration'; then
-
-        echo -e "${GREEN}✓ 已存在有效 WARP 注册${NC}"
-
     else
-        # registration show 在部分版本输出格式不同
-        STATUS=$(warp-cli --accept-tos status 2>&1 || true)
-
-        if echo "$STATUS" | grep -qi 'Registration Missing'; then
-            echo "检测到 Registration Missing，重新注册..."
-
-            warp-cli --accept-tos registration delete 2>/dev/null || true
-            sleep 2
-
-            if ! warp-cli --accept-tos registration new; then
-                echo -e "${RED}✗ WARP 注册失败${NC}"
-                warp-cli --accept-tos status || true
-                exit 1
-            fi
-
-            sleep 3
-        fi
+        echo -e "${GREEN}✓ WARP 已存在注册信息${NC}"
     fi
 
     echo "设置 Local Proxy 模式..."
 
     if ! warp-cli --accept-tos mode proxy; then
-        echo -e "${RED}✗ 无法设置 WARP proxy 模式${NC}"
+        echo -e "${RED}✗ 设置 proxy 模式失败${NC}"
         exit 1
     fi
 
     if ! warp-cli --accept-tos proxy port 40000; then
-        echo -e "${RED}✗ 无法设置 WARP proxy 端口 40000${NC}"
+        echo -e "${RED}✗ 设置 proxy 端口 40000 失败${NC}"
         exit 1
     fi
 
     echo "连接 WARP..."
 
-    if ! warp-cli --accept-tos connect; then
-        echo -e "${RED}✗ WARP connect 执行失败${NC}"
+    warp-cli --accept-tos connect || {
+        echo -e "${RED}✗ warp-cli connect 执行失败${NC}"
         exit 1
-    fi
+    }
 
-    # 等待 Connected
+    #
+    # 等待真正进入 Connected 状态
+    #
     CONNECTED=false
 
-    for i in $(seq 1 20); do
+    for i in $(seq 1 30); do
         STATUS=$(warp-cli --accept-tos status 2>&1 || true)
+
+        echo "等待 WARP 连接... ($i/30)"
         echo "$STATUS"
 
-        if echo "$STATUS" | grep -qi 'Connected'; then
+        # 注意：必须匹配完整的 Connected 状态
+        # 不能用 grep 'Connected'，否则 Disconnected 也会匹配
+        if echo "$STATUS" | grep -qiE \
+            '^Status update:[[:space:]]*Connected[[:space:]]*$'; then
+
             CONNECTED=true
             break
+        fi
+
+        # 如果仍然是 Disconnected，隔几秒再尝试一次 connect
+        if echo "$STATUS" | grep -qiE \
+            '^Status update:[[:space:]]*Disconnected'; then
+
+            if [ $((i % 5)) -eq 0 ]; then
+                echo "WARP 仍处于 Disconnected，重新发送 connect..."
+                warp-cli --accept-tos connect >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # 如果注册突然丢失，直接报错
+        if echo "$STATUS" | grep -qi 'Registration Missing'; then
+            echo -e "${RED}✗ WARP 注册信息丢失${NC}"
+            echo "$STATUS"
+            exit 1
         fi
 
         sleep 2
     done
 
     if [ "$CONNECTED" != true ]; then
-        echo -e "${RED}✗ WARP 未能进入 Connected 状态${NC}"
+        echo -e "${RED}✗ WARP 在 60 秒内未能进入 Connected 状态${NC}"
+        echo ""
+        warp-cli --accept-tos status || true
+        echo ""
+        systemctl status warp-svc --no-pager -l
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓ WARP 已连接${NC}"
+
+    #
+    # Connected 后等待 SOCKS 40000 真正开始监听
+    #
+    PROXY_READY=false
+
+    for i in $(seq 1 15); do
+        if ss -lntp 2>/dev/null | grep -qE \
+            '127\.0\.0\.1:40000|0\.0\.0\.0:40000|\[::1\]:40000'; then
+
+            PROXY_READY=true
+            break
+        fi
+
+        echo "等待 SOCKS5 端口 40000... ($i/15)"
+        sleep 1
+    done
+
+    if [ "$PROXY_READY" != true ]; then
+        echo -e "${RED}✗ WARP 已 Connected，但 SOCKS5 端口 40000 未监听${NC}"
+        echo ""
+        ss -lntp | grep 40000 || true
+        echo ""
         warp-cli --accept-tos status || true
         exit 1
     fi
 
-    # 验证本地 SOCKS 端口
-    if ! ss -lnt 2>/dev/null | grep -q ':40000'; then
-        echo -e "${RED}✗ WARP 已连接，但 127.0.0.1:40000 未监听${NC}"
+    echo -e "${GREEN}✓ SOCKS5 已监听: 127.0.0.1:40000${NC}"
+
+    #
+    # 最后实际测试 SOCKS
+    #
+    echo "测试 WARP SOCKS5..."
+
+    WARP_TEST_IP=$(curl \
+        -x socks5://127.0.0.1:40000 \
+        -4 \
+        -s \
+        --max-time 10 \
+        ip.sb 2>/dev/null)
+
+    if [ -z "$WARP_TEST_IP" ]; then
+        echo -e "${RED}✗ SOCKS5 端口已监听，但无法通过 WARP 访问互联网${NC}"
         exit 1
     fi
 
-    echo -e "${GREEN}✓ WARP 已注册并连接${NC}"
-    echo -e "${GREEN}✓ SOCKS5 代理端口: 127.0.0.1:40000${NC}"
+    echo -e "${GREEN}✓ WARP SOCKS5 工作正常${NC}"
+    echo -e "${GREEN}✓ WARP 出口 IP: $WARP_TEST_IP${NC}"
 }
 
 setup_transparent_proxy() {
