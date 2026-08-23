@@ -83,29 +83,134 @@ EOF
 configure_warp() {
     echo -e "\n${CYAN}[2/3] 配置 WARP...${NC}"
 
-    echo "正在注册设备..."
-    warp-cli --accept-tos registration new 2>/dev/null \
-        || warp-cli --accept-tos register 2>/dev/null \
-        || true
+    echo "等待 warp-svc 启动..."
 
-    warp-cli --accept-tos mode proxy 2>/dev/null \
-        || warp-cli mode proxy 2>/dev/null \
-        || true
+    systemctl enable warp-svc 2>/dev/null || true
+    systemctl restart warp-svc
 
-    warp-cli --accept-tos proxy port 40000 2>/dev/null \
-        || warp-cli proxy port 40000 2>/dev/null \
-        || true
+    # 最多等待 20 秒
+    for i in $(seq 1 20); do
+        if systemctl is-active --quiet warp-svc; then
+            sleep 2
+            break
+        fi
+        sleep 1
+    done
 
-    echo "正在连接 WARP..."
-    warp-cli --accept-tos connect 2>/dev/null \
-        || warp-cli connect 2>/dev/null \
-        || true
+    if ! systemctl is-active --quiet warp-svc; then
+        echo -e "${RED}✗ warp-svc 启动失败${NC}"
+        systemctl status warp-svc --no-pager -l
+        exit 1
+    fi
 
-    sleep 3
+    echo -e "${GREEN}✓ warp-svc 已启动${NC}"
 
-    STATUS=$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null)
-    echo -e "状态: ${GREEN}$STATUS${NC}"
-    echo -e "${GREEN}✓ WARP 配置完成${NC}"
+    # 等待 CLI 与 daemon IPC 完全可用
+    for i in $(seq 1 15); do
+        STATUS=$(warp-cli --accept-tos status 2>&1)
+
+        if ! echo "$STATUS" | grep -qiE \
+            'Daemon Startup|Unable to connect|IPC|initializing'; then
+            break
+        fi
+
+        echo "等待 WARP daemon 就绪... ($i/15)"
+        sleep 2
+    done
+
+    echo "检查 WARP 注册状态..."
+
+    REGISTRATION=$(warp-cli --accept-tos registration show 2>&1 || true)
+
+    if echo "$REGISTRATION" | grep -qiE \
+        'not registered|registration missing|no registration|error'; then
+
+        echo "当前设备未注册，开始注册..."
+
+        if ! warp-cli --accept-tos registration new; then
+            echo -e "${RED}✗ WARP 注册失败${NC}"
+            echo ""
+            warp-cli --accept-tos status || true
+            echo ""
+            systemctl status warp-svc --no-pager -l
+            exit 1
+        fi
+
+        sleep 3
+
+    elif echo "$REGISTRATION" | grep -qiE \
+        'Account type|Device|Registration'; then
+
+        echo -e "${GREEN}✓ 已存在有效 WARP 注册${NC}"
+
+    else
+        # registration show 在部分版本输出格式不同
+        STATUS=$(warp-cli --accept-tos status 2>&1 || true)
+
+        if echo "$STATUS" | grep -qi 'Registration Missing'; then
+            echo "检测到 Registration Missing，重新注册..."
+
+            warp-cli --accept-tos registration delete 2>/dev/null || true
+            sleep 2
+
+            if ! warp-cli --accept-tos registration new; then
+                echo -e "${RED}✗ WARP 注册失败${NC}"
+                warp-cli --accept-tos status || true
+                exit 1
+            fi
+
+            sleep 3
+        fi
+    fi
+
+    echo "设置 Local Proxy 模式..."
+
+    if ! warp-cli --accept-tos mode proxy; then
+        echo -e "${RED}✗ 无法设置 WARP proxy 模式${NC}"
+        exit 1
+    fi
+
+    if ! warp-cli --accept-tos proxy port 40000; then
+        echo -e "${RED}✗ 无法设置 WARP proxy 端口 40000${NC}"
+        exit 1
+    fi
+
+    echo "连接 WARP..."
+
+    if ! warp-cli --accept-tos connect; then
+        echo -e "${RED}✗ WARP connect 执行失败${NC}"
+        exit 1
+    fi
+
+    # 等待 Connected
+    CONNECTED=false
+
+    for i in $(seq 1 20); do
+        STATUS=$(warp-cli --accept-tos status 2>&1 || true)
+        echo "$STATUS"
+
+        if echo "$STATUS" | grep -qi 'Connected'; then
+            CONNECTED=true
+            break
+        fi
+
+        sleep 2
+    done
+
+    if [ "$CONNECTED" != true ]; then
+        echo -e "${RED}✗ WARP 未能进入 Connected 状态${NC}"
+        warp-cli --accept-tos status || true
+        exit 1
+    fi
+
+    # 验证本地 SOCKS 端口
+    if ! ss -lnt 2>/dev/null | grep -q ':40000'; then
+        echo -e "${RED}✗ WARP 已连接，但 127.0.0.1:40000 未监听${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✓ WARP 已注册并连接${NC}"
+    echo -e "${GREEN}✓ SOCKS5 代理端口: 127.0.0.1:40000${NC}"
 }
 
 setup_transparent_proxy() {
